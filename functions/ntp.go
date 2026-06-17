@@ -9,12 +9,20 @@ import (
 
 // NTP Constants
 const (
-	DEFAULT_NTP_SERVER          = "time.nist.gov" // Default NTP server
-	NTP_SYNC_INTERVAL_MINUTES   = 60              // Sync with NTP every hour
-	NTP_RETRY_INTERVAL_SECONDS  = 30              // Retry after 30 seconds if NTP sync fails
-	NTP_MAX_RETRIES             = 5               // Maximum number of retries before giving up
-	NTP_TIME_DIFF_THRESHOLD_SEC = 2               // Threshold for adjusting time (in seconds)
+	DEFAULT_NTP_SERVER          = "pool.ntp.org" // Default NTP server
+	NTP_SYNC_INTERVAL_MINUTES   = 60             // Sync with NTP every hour
+	NTP_RETRY_INTERVAL_SECONDS  = 30             // Retry after 30 seconds if NTP sync fails
+	NTP_MAX_RETRIES             = 5              // Maximum number of retries before giving up
+	NTP_TIME_DIFF_THRESHOLD_SEC = 2              // Threshold for adjusting time (in seconds)
 )
+
+// ntpFallbackServers are tried in order so one dead server cannot block a sync.
+var ntpFallbackServers = []string{
+	"pool.ntp.org",
+	"time.google.com",
+	"time.cloudflare.com",
+	"time.nist.gov",
+}
 
 // NTPSyncer handles time synchronization with NTP servers
 type NTPSyncer struct {
@@ -53,14 +61,28 @@ func (n *NTPSyncer) EnableDebug(debug bool) {
 	n.debugMode = debug
 }
 
-// GetCurrentTime returns the current time adjusted by NTP
+// GetCurrentTime returns the current time from the first NTP server that
+// answers. The configured server is tried first, then the fallback list. The
+// loop has a fixed upper bound (Power-of-Ten rule 2).
 func (n *NTPSyncer) GetCurrentTime() (time.Time, error) {
-	response, err := ntp.Query(n.server)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("NTP query error: %v", err)
+	servers := append([]string{n.server}, ntpFallbackServers...)
+	var lastErr error
+	for _, server := range servers {
+		if server == "" {
+			continue
+		}
+		response, err := ntp.Query(server)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if err := response.Validate(); err != nil {
+			lastErr = err
+			continue
+		}
+		return time.Now().Add(response.ClockOffset), nil
 	}
-
-	return time.Now().Add(response.ClockOffset), nil
+	return time.Time{}, fmt.Errorf("all NTP servers failed: %v", lastErr)
 }
 
 // ShouldSync returns true if it's time to sync with NTP

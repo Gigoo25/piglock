@@ -1,10 +1,21 @@
+// Command piclock drives an analog quartz (Lavet-motor) wall clock from a
+// Raspberry Pi, keeping the physical hands locked to true time. It can tick
+// forward (fast catch-up) and reverse (ESPCLOCK4 waveform), choosing whichever
+// direction corrects the hands fastest.
+//
+// Design and the four bulletproofing requirements are documented in CLAUDE.md.
+// The code follows a Go-adaptation of NASA/JPL's Power of Ten rules.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"math"
-	"sync"
+	"log"
+	"os/signal"
+	"runtime"
+	"runtime/debug"
+	"syscall"
 	"time"
 
 	"piclock/functions"
@@ -12,373 +23,410 @@ import (
 	rpio "github.com/stianeikeland/go-rpio/v4"
 )
 
-// GPIO Constants
-const TICK_PIN1 = 12
-const TICK_PIN2 = 13
+const (
+	tickPin1 = 12 // coil lead A
+	tickPin2 = 13 // coil lead B
+	i2cBus   = 1
 
-// Timing Constants
-const FORWARD_TICK_DURATION_MS = 32
-const FORWARD_TICK_DELAY_MS = 32
-const FORWARD_TICK_DUTY_CYCLE = 60 // 60% duty cycle for forward ticking
+	normalSleep     = time.Second // tracking step period and error backoff
+	dialSeconds     = 12 * 3600   // positions on a 12-hour face
+	normalThreshold = 1           // fwd distance treated as in-step tracking
+	rtPriority      = 50          // SCHED_FIFO priority for the tick thread
 
-const REVERSE_TICK_SHORT_DURATION_MS = 10
-const REVERSE_TICK_SHORT_DELAY_MS = 7
-const REVERSE_TICK_LONG_DURATION_MS = 28
-const REVERSE_TICK_LONG_DELAY_MS = 0
-const REVERSE_TICK_DUTY_CYCLE_A = 90  // 90% duty cycle for region A (35-55 seconds)
-const REVERSE_TICK_DUTY_CYCLE_B = 82  // 82% duty cycle for region B (all other positions)
-const REVERSE_TICK_REGION_A_LOW = 35  // Start of region A
-const REVERSE_TICK_REGION_A_HIGH = 55 // End of region A
+	ntpFirstDelay = 5 * time.Second
+	ntpInterval   = 60 * time.Minute
 
-// PWM Configuration
-const PWM_FREQUENCY = 10000 // 10 kHz PWM frequency
-const PWM_RANGE = 100       // 0-100 range for duty cycle
-
-// NTP Constants
-const NTP_SYNC_INTERVAL_SECONDS = 3600
-
-// Clock status variables
-var (
-	fast_forward = false
-	paused       = false
-	reverse      = false
-	time_diff    = 0 // Store the time difference in seconds
-	mutex        = &sync.Mutex{}
+	defaultConfigPath = "/etc/piclock/clock.json"
+	testPreTicks      = 5 // forward ticks to settle polarity before a test run
 )
 
-// Clock hand positions
-var (
-	clock_hour   int = 0
-	clock_minute int = 0
-	clock_second int = 0
-)
-
-// Simple pulse function without PWM
-func send_pulse(pin rpio.Pin, duration_ms int, next_tick_delay_ms int) {
-	pin.Output()
-	pin.High()
-	fmt.Printf("Simple pulse: pin=%d, duration=%dms\n", pin, duration_ms)
-	time.Sleep(time.Duration(duration_ms) * time.Millisecond)
-	pin.Low()
-	time.Sleep(time.Duration(next_tick_delay_ms) * time.Millisecond)
+// Clock owns all hardware, the tick parameters, and the single authoritative
+// hand position and pin polarity.
+type Clock struct {
+	rtc  *functions.DS3231
+	fram *functions.FRAM
+	cfg  TickConfig
+	pin1 rpio.Pin
+	pin2 rpio.Pin
+	cur  rpio.Pin
+	pos  position
 }
 
-func forward_tick(current_tick_pin *rpio.Pin, tick_pin_1 rpio.Pin, tick_pin_2 rpio.Pin) {
-	// Try simple pulse first
-	send_pulse(*current_tick_pin, FORWARD_TICK_DURATION_MS, FORWARD_TICK_DELAY_MS)
-
-	// Alternate between pins
-	if *current_tick_pin == tick_pin_1 {
-		*current_tick_pin = tick_pin_2
-	} else {
-		*current_tick_pin = tick_pin_1
-	}
-}
-
-func reverse_tick(current_tick_pin *rpio.Pin, tick_pin_1 rpio.Pin, tick_pin_2 rpio.Pin, position int) {
-	// First pulse (10ms) on current pin
-	send_pulse(*current_tick_pin, REVERSE_TICK_SHORT_DURATION_MS, REVERSE_TICK_SHORT_DELAY_MS)
-
-	// Switch pins
-	if *current_tick_pin == tick_pin_2 {
-		*current_tick_pin = tick_pin_1
-	} else {
-		*current_tick_pin = tick_pin_2
-	}
-
-	// Second pulse (28ms) on new pin
-	send_pulse(*current_tick_pin, REVERSE_TICK_LONG_DURATION_MS, REVERSE_TICK_LONG_DELAY_MS)
-}
-
-func update_clock_position(clock_hour int, clock_minute int, clock_second int, reverse bool) (int, int, int) {
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	if reverse == true {
-		clock_second = (clock_second - 1)
-		if clock_second < 0 {
-			clock_second = 59
-			clock_minute = (clock_minute - 1)
-			if clock_minute < 0 {
-				clock_minute = 59
-				clock_hour = (clock_hour - 1)
-				if clock_hour < 0 {
-					clock_hour = 11
-				}
-			}
-		}
-	} else {
-		clock_second = (clock_second + 1)
-		if clock_second >= 60 {
-			clock_second = 0
-			clock_minute = (clock_minute + 1)
-			if clock_minute >= 60 {
-				clock_minute = 0
-				clock_hour = (clock_hour + 1)
-				if clock_hour >= 12 {
-					clock_hour = 0
-				}
-			}
-		}
-	}
-
-	return clock_hour, clock_minute, clock_second
-}
-
-func calculate_time_difference(rtc_hour, rtc_minute, rtc_second int) int {
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	// Convert clock hour to 24-hour format for comparison
-	var clock_hour_24 int
-	if clock_hour == 12 {
-		if rtc_hour < 12 {
-			clock_hour_24 = 0
-		} else {
-			clock_hour_24 = 12
-		}
-	} else {
-		clock_hour_24 = clock_hour
-		if rtc_hour >= 12 {
-			clock_hour_24 += 12
-		}
-	}
-
-	// Calculate total seconds for each time
-	rtc_total_seconds := rtc_hour*3600 + rtc_minute*60 + rtc_second
-	clock_total_seconds := clock_hour_24*3600 + clock_minute*60 + clock_second
-
-	// Calculate difference
-	total_seconds_diff := rtc_total_seconds - clock_total_seconds
-
-	// Account for 12-hour wraparound
-	if total_seconds_diff > 21600 {
-		total_seconds_diff -= 43200
-	} else if total_seconds_diff < -21600 {
-		total_seconds_diff += 43200
-	}
-
-	return total_seconds_diff
-}
-
-func synchronize_clock(ds3231 *functions.DS3231) {
-	// Read time from RTC
-	rtc_hour, rtc_minute, rtc_second, err := ds3231.ReadTime()
+// nextAction reads the time source and decides the next tick action.
+func (c *Clock) nextAction() (action, error) {
+	stopped, err := c.rtc.OscillatorStopped()
 	if err != nil {
-		fmt.Println("Error reading from DS3231:", err)
-		return
+		return actHold, err // RTC unreadable: hold rather than move blindly
 	}
+	if stopped {
+		return actStepNormal, nil // time untrusted: free-wheel forward at 1 Hz
+	}
+	h, m, s, err := c.rtc.ReadClock()
+	if err != nil {
+		return actHold, err
+	}
+	target := (h%12)*3600 + m*60 + s
+	if err := functions.Assert(target >= 0 && target < dialSeconds, "target dial in range"); err != nil {
+		return actHold, err
+	}
+	hand := c.pos.toDial()
+	if err := functions.Assert(hand >= 0 && hand < dialSeconds, "hand dial in range"); err != nil {
+		return actHold, err
+	}
+	act := decide(hand, target, c.cfg.FwdRate, c.cfg.RevRate)
+	if act == actStepReverse && !c.cfg.RevEnabled {
+		return actHold, nil // reverse disabled: wait for time to catch up instead
+	}
+	return act, nil
+}
 
-	// Calculate time difference
-	diff := calculate_time_difference(rtc_hour, rtc_minute, rtc_second)
-
-	mutex.Lock()
-	// Store the difference in the global variable
-	time_diff = diff
-	fmt.Printf("RTC time: %02d:%02d:%02d\n", rtc_hour, rtc_minute, rtc_second)
-	fmt.Printf("Clock position: %02d:%02d:%02d\n", clock_hour, clock_minute, clock_second)
-	fmt.Printf("Difference: %d seconds\n", diff)
-	mutex.Unlock()
-
-	tolerance := 1
-
-	if math.Abs(float64(diff)) <= float64(tolerance) {
-		fmt.Println("Clock is in sync with RTC time")
-		fast_forward = false
-		reverse = false
-		return
-	} else if diff > tolerance {
-		fmt.Printf("Clock is behind RTC time by %d seconds\n", diff)
-		fast_forward = true
-		reverse = false
-	} else {
-		fmt.Printf("Clock is ahead of RTC time by %d seconds\n", -diff)
-		fast_forward = false
-		reverse = true // Set reverse flag when clock is ahead
-		return
+// run is the tick loop. It is the single intentionally-unbounded loop, governed
+// by ctx (Power-of-Ten rule 2 exception, documented in CLAUDE.md).
+func (c *Clock) run(ctx context.Context, wd *functions.Watchdog) {
+	fastSleep := time.Second / time.Duration(c.cfg.FwdRate)
+	revSleep := time.Second / time.Duration(c.cfg.RevRate)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		start := time.Now()
+		runtime.GC() // collect now, between pulses (auto-GC is disabled)
+		if err := wd.Alive(); err != nil {
+			log.Printf("watchdog ping: %v", err)
+		}
+		act, err := c.nextAction()
+		if err != nil {
+			log.Printf("decision: %v", err)
+			sleepRemaining(ctx, start, normalSleep)
+			continue
+		}
+		switch act {
+		case actStepFast:
+			tickLog(c.forwardTick(true))
+			sleepCtx(ctx, fastSleep)
+		case actStepReverse:
+			tickLog(c.reverseTick())
+			sleepCtx(ctx, revSleep)
+		case actStepNormal:
+			tickLog(c.forwardTick(false))
+			sleepRemaining(ctx, start, normalSleep)
+		default: // actHold: keep the 1 Hz cadence so the next tick lands on time
+			sleepRemaining(ctx, start, normalSleep)
+		}
 	}
 }
 
-func continuous_sync_rtc_with_ntp(ds3231 *functions.DS3231, ntpSyncer *functions.NTPSyncer) {
-	for {
-		// Try to sync RTC with NTP
-		fmt.Println("Syncing RTC with NTP...")
-		ntp_hour, ntp_minute, ntp_second, err := ntpSyncer.SyncTime()
-		if err == nil {
-			// Update RTC with NTP time
-			err = ds3231.WriteTime(ntp_hour, ntp_minute, ntp_second)
-			if err != nil {
-				fmt.Printf("Error writing time to DS3231: %v\n", err)
-			} else {
-				fmt.Printf("RTC synchronized with NTP: %02d:%02d:%02d\n",
-					ntp_hour, ntp_minute, ntp_second)
-			}
-		} else {
-			fmt.Printf("Failed to get NTP time: %v\n", err)
-		}
-
-		// Sleep before next sync
-		time.Sleep(NTP_SYNC_INTERVAL_SECONDS * time.Second)
+// sleepRemaining sleeps so the loop iteration started at start lasts period in
+// total, absorbing per-iteration work (GC, I2C reads, the pulse) so 1 Hz
+// tracking does not accumulate lag and insert catch-up ticks.
+func sleepRemaining(ctx context.Context, start time.Time, period time.Duration) {
+	d := period - time.Since(start)
+	if d < 0 {
+		d = 0
 	}
+	sleepCtx(ctx, d)
+}
+
+// tickLog logs (but survives) a tick failure.
+func tickLog(err error) {
+	if err != nil {
+		log.Printf("tick: %v", err)
+	}
+}
+
+// shutdown drives the coil low, closes devices, then releases the GPIO mapping.
+// Order matters: pins must be driven low while GPIO memory is still mapped, so
+// rpio.Close() is the final step (not a separate defer, which under LIFO would
+// run first and unmap memory before pin.Low()).
+func (c *Clock) shutdown() {
+	c.pin1.Low()
+	c.pin2.Low()
+	if c.fram != nil {
+		c.fram.Close()
+	}
+	if c.rtc != nil {
+		c.rtc.Close()
+	}
+	rpio.Close()
+}
+
+// sleepCtx sleeps for d unless ctx is cancelled first.
+func sleepCtx(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+// rtcWaitTries bounds the startup wait for the RTC (Power-of-Ten rule 2).
+const rtcWaitTries = 30
+
+// waitForRTC waits, with a fixed upper bound, for the DS3231 to respond so a
+// slow or briefly-flaky I2C bus at boot does not crash-loop the service.
+func waitForRTC(rtc *functions.DS3231) error {
+	if err := functions.Assert(rtc != nil, "rtc non-nil"); err != nil {
+		return err
+	}
+	for range rtcWaitTries {
+		if rtc.IsAvailable() {
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+	return &setupError{"DS3231 not responding after wait"}
+}
+
+// openPins configures the two coil pins as outputs driven low, current = pin1.
+func (c *Clock) openPins() {
+	c.pin1 = rpio.Pin(tickPin1)
+	c.pin2 = rpio.Pin(tickPin2)
+	c.pin1.Output()
+	c.pin2.Output()
+	c.pin1.Low()
+	c.pin2.Low()
+	c.cur = c.pin1
+}
+
+// setup opens the GPIO and I2C hardware and returns a ready Clock.
+func setup(cfg TickConfig) (*Clock, error) {
+	if err := rpio.Open(); err != nil {
+		return nil, err
+	}
+	rtc, err := functions.NewDS3231(i2cBus)
+	if err != nil {
+		return nil, err
+	}
+	if err := waitForRTC(rtc); err != nil {
+		return nil, err
+	}
+	if err := rtc.EnsureRunning(); err != nil {
+		log.Printf("ensure RTC oscillator running: %v", err)
+	}
+	fram, err := functions.NewFRAM(i2cBus)
+	if err != nil {
+		return nil, err
+	}
+	c := &Clock{rtc: rtc, fram: fram, cfg: cfg}
+	c.openPins()
+	return c, nil
+}
+
+type setupError struct{ msg string }
+
+func (e *setupError) Error() string { return e.msg }
+
+// initPosition loads hand position and pin polarity from flags, else FRAM, else
+// 12:00:00. Setting from flags resets polarity to pin1.
+func (c *Clock) initPosition(h, m, s int) {
+	if h >= 0 && h <= 11 && m >= 0 && m <= 59 && s >= 0 && s <= 59 {
+		c.pos = position{h, m, s}
+		c.cur = c.pin1
+		if err := c.persist(); err != nil {
+			log.Printf("persist initial position: %v", err)
+		}
+		log.Printf("position set from flags: %02d:%02d:%02d", h, m, s)
+		return
+	}
+	sh, sm, ss, pinB, err := c.fram.ReadState()
+	if err != nil {
+		c.pos = position{0, 0, 0}
+		c.cur = c.pin1
+		log.Printf("no valid FRAM position, starting at 12:00:00")
+		return
+	}
+	c.pos = position{sh, sm, ss}
+	if pinB {
+		c.cur = c.pin2
+	} else {
+		c.cur = c.pin1
+	}
+	log.Printf("position restored from FRAM: %02d:%02d:%02d (pinB=%v)", sh, sm, ss, pinB)
+}
+
+// ntpLoop periodically trims the RTC to NTP. It is a long-lived goroutine loop
+// governed by ctx (rule 2 exception) and recovers from panics so a transient
+// network library fault cannot take down the process.
+func ntpLoop(ctx context.Context, rtc *functions.DS3231) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ntp loop recovered: %v", r)
+		}
+	}()
+	syncer := functions.NewNTPSyncer("")
+	timer := time.NewTimer(ntpFirstDelay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			syncRTC(rtc, syncer)
+			timer.Reset(ntpInterval)
+		}
+	}
+}
+
+// syncRTC pulls NTP time and writes it to the RTC, clearing the stop flag.
+func syncRTC(rtc *functions.DS3231, syncer *functions.NTPSyncer) {
+	t, err := syncer.GetCurrentTime()
+	if err != nil {
+		log.Printf("ntp: %v", err)
+		return
+	}
+	if err := rtc.WriteTime(t.Hour(), t.Minute(), t.Second()); err != nil {
+		log.Printf("rtc write: %v", err)
+		return
+	}
+	if err := rtc.ClearOSF(); err != nil {
+		log.Printf("clear OSF: %v", err)
+	}
+	log.Printf("rtc synced to ntp: %02d:%02d:%02d", t.Hour(), t.Minute(), t.Second())
+}
+
+// runSet writes the given hand position to FRAM and returns. Clean alignment
+// path: no GPIO, no RT, no tick loop. Hour 12 is an alias for the 12-o'clock
+// origin (stored as 0); polarity is reset to pin1.
+func runSet(h, m, s int) error {
+	if h < 0 || h > 12 || m < 0 || m > 59 || s < 0 || s > 59 {
+		return fmt.Errorf("set requires -hour 0..12 and -minute/-second 0..59")
+	}
+	if h == 12 {
+		h = 0
+	}
+	if err := functions.Assert(h >= 0 && h <= 11, "set hour normalized to 0..11"); err != nil {
+		return err
+	}
+	fram, err := functions.NewFRAM(i2cBus)
+	if err != nil {
+		return err
+	}
+	defer fram.Close()
+	if err := fram.WriteState(h, m, s, false); err != nil {
+		return err
+	}
+	log.Printf("FRAM position set to %02d:%02d:%02d (12-o'clock origin = hour 0)", h, m, s)
+	return nil
+}
+
+// runTest ticks continuously in one direction for calibration. It settles
+// polarity with a few forward ticks, then ticks "fwd" or "rev" until cancelled.
+// No RTC/FRAM; observe the hands and tune the config, then re-run.
+func runTest(ctx context.Context, dir string, cfg TickConfig, count int) error {
+	if err := functions.Assert(dir == "fwd" || dir == "rev", "test dir is fwd or rev"); err != nil {
+		return err
+	}
+	if err := rpio.Open(); err != nil {
+		return err
+	}
+	c := &Clock{cfg: cfg}
+	c.openPins()
+	defer func() { c.pin1.Low(); c.pin2.Low(); rpio.Close() }()
+
+	rev := dir == "rev"
+	sleep := time.Second / time.Duration(cfg.FwdRate)
+	if rev {
+		sleep = time.Second / time.Duration(cfg.RevRate)
+	}
+	if count <= 0 {
+		for range testPreTicks { // settle polarity before an open-ended run
+			tickLog(c.forwardTick(false))
+			sleepCtx(ctx, normalSleep)
+		}
+		log.Printf("test %s: starting (Ctrl-C to stop)", dir)
+	} else {
+		log.Printf("test %s: %d ticks (exact) — second hand should return to start", dir, count)
+	}
+	for n := 0; count <= 0 || n < count; n++ {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		if rev {
+			tickLog(c.reverseTick())
+		} else {
+			tickLog(c.forwardTick(true))
+		}
+		if count <= 0 && n%10 == 0 {
+			log.Printf("test %s: %d ticks", dir, n)
+		}
+		sleepCtx(ctx, sleep)
+	}
+	log.Printf("test %s: done", dir)
+	return nil
 }
 
 func main() {
-	// Define command line flags for setting time
-	hourFlag := flag.Int("hour", -1, "Set clock hour (0-11)")
-	minuteFlag := flag.Int("minute", -1, "Set clock minute (0-59)")
-	secondFlag := flag.Int("second", -1, "Set clock second (0-59)")
-
-	// Parse command line flags
+	hourFlag := flag.Int("hour", -1, "Set hand hour (0-11; 12 = 12 o'clock)")
+	minuteFlag := flag.Int("minute", -1, "Set hand minute (0-59)")
+	secondFlag := flag.Int("second", -1, "Set hand second (0-59)")
+	setFlag := flag.Bool("set", false, "write -hour/-minute/-second to FRAM and exit (hand alignment)")
+	testFlag := flag.String("test", "", "calibration tick test: 'fwd' or 'rev' (no RTC/FRAM)")
+	countFlag := flag.Int("count", 0, "exact number of ticks for -test (0 = run until Ctrl-C)")
+	configPath := flag.String("config", defaultConfigPath, "path to tick-parameter JSON config")
 	flag.Parse()
 
-	fmt.Println("Starting PiClock")
-
-	// Initialize GPIO
-	err := rpio.Open()
-	if err != nil {
-		fmt.Println("Error opening GPIO:", err)
-		return
-	}
-	defer rpio.Close()
-
-	// Initialize DS3231 RTC
-	ds3231, err := functions.NewDS3231(1) // Using I2C bus 1
-	if err != nil {
-		fmt.Println("Error opening DS3231:", err)
-		return
-	}
-	defer ds3231.Close()
-
-	// Check if DS3231 is available
-	if !ds3231.IsAvailable() {
-		fmt.Println("DS3231 not found or not responding")
+	if *setFlag {
+		if err := runSet(*hourFlag, *minuteFlag, *secondFlag); err != nil {
+			log.Fatalf("set: %v", err)
+		}
 		return
 	}
 
-	// Initialize FRAM
-	fram, err := functions.NewFRAM(1) // Using I2C bus 1
+	cfg, err := LoadTickConfig(*configPath)
 	if err != nil {
-		fmt.Println("Error opening FRAM:", err)
-	}
-	defer fram.Close()
-
-	// Initialize NTP syncer
-	ntpSyncer := functions.NewNTPSyncer("") // Empty string means use default server
-
-	// Initialize pins outside the loop
-	tick_pin_1 := rpio.Pin(TICK_PIN1)
-	tick_pin_2 := rpio.Pin(TICK_PIN2)
-	tick_pin_1.Output()
-	tick_pin_2.Output()
-	current_tick_pin := tick_pin_1
-
-	// Check if time flags were provided to set clock time
-	time_reset := false
-	if *hourFlag >= 0 && *hourFlag <= 11 &&
-		*minuteFlag >= 0 && *minuteFlag <= 59 &&
-		*secondFlag >= 0 && *secondFlag <= 59 {
-		// Set clock time from flags
-		clock_hour = *hourFlag
-		clock_minute = *minuteFlag
-		clock_second = *secondFlag
-
-		// Update FRAM with the new time
-		err = fram.WriteTime(clock_hour, clock_minute, clock_second)
-		if err != nil {
-			fmt.Println("Error setting initial time in FRAM:", err)
-		} else {
-			fmt.Printf("Clock initialized from flags to %02d:%02d:%02d\n",
-				clock_hour, clock_minute, clock_second)
-			time_reset = true
-		}
+		log.Fatalf("config %s: %v", *configPath, err)
 	}
 
-	// If no flags were provided or setting time failed, read from FRAM
-	if !time_reset {
-		stored_hour, stored_minute, stored_second, err := fram.ReadTime()
-		if err == nil {
-			// Successfully read time from FRAM
-			clock_hour = stored_hour
-			clock_minute = stored_minute
-			clock_second = stored_second
-			fmt.Println("Loaded time from FRAM:", clock_hour, ":", clock_minute, ":", clock_second)
-		} else {
-			fmt.Println("No valid time data in FRAM, initializing to 00:00:00")
-		}
+	// Disable automatic GC so a collection never pauses the thread mid-pulse
+	// (the source of software-PWM jitter). The tick loop calls runtime.GC() in
+	// the idle gap between ticks, keeping memory bounded without ever colliding
+	// with a pulse.
+	debug.SetGCPercent(-1)
+
+	if err := functions.SetThreadRealtime(rtPriority); err != nil {
+		log.Printf("realtime scheduling unavailable, continuing: %v", err)
 	}
 
-	// Perform initial NTP sync
-	fmt.Println("Performing initial NTP sync...")
-	ntp_hour, ntp_minute, ntp_second, err := ntpSyncer.SyncTime()
-	if err == nil {
-		// Update RTC with NTP time
-		err = ds3231.WriteTime(ntp_hour, ntp_minute, ntp_second)
-		if err != nil {
-			fmt.Printf("Error writing time to DS3231: %v\n", err)
-		} else {
-			fmt.Printf("RTC initialized with NTP: %02d:%02d:%02d\n",
-				ntp_hour, ntp_minute, ntp_second)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	if *testFlag != "" {
+		if err := runTest(ctx, *testFlag, cfg, *countFlag); err != nil {
+			log.Fatalf("test: %v", err)
 		}
-	} else {
-		fmt.Printf("Failed to get initial NTP time: %v\n", err)
+		return
 	}
 
-	// Start a goroutine to continuously sync RTC with NTP
-	go continuous_sync_rtc_with_ntp(ds3231, ntpSyncer)
-
-	for {
-		mutex.Lock()
-		is_paused := paused
-		is_fast_forward := fast_forward
-		mutex.Unlock()
-
-		if !is_paused {
-			// Synchronize with RTC first
-			synchronize_clock(ds3231)
-
-			mutex.Lock()
-			is_fast_forward = fast_forward
-			is_reverse := reverse
-			mutex.Unlock()
-
-			// Perform tick based on synchronization result
-			if is_reverse {
-				fmt.Println("Ticking in reverse")
-				reverse_tick(&current_tick_pin, tick_pin_1, tick_pin_2, clock_second)
-				// Fix: Pass all required arguments to update_clock_position
-				clock_hour, clock_minute, clock_second = update_clock_position(clock_hour, clock_minute, clock_second, true)
-			} else {
-				fmt.Println("Ticking forward")
-				forward_tick(&current_tick_pin, tick_pin_1, tick_pin_2)
-				// Fix: Pass all required arguments to update_clock_position
-				clock_hour, clock_minute, clock_second = update_clock_position(clock_hour, clock_minute, clock_second, false)
-			}
-
-			// Save time to FRAM every second
-			err := fram.WriteTime(clock_hour, clock_minute, clock_second)
-			if err != nil {
-				fmt.Println("Error saving time to FRAM:", err)
-			}
-
-			fmt.Printf("Clock Time: %02d:%02d:%02d\n", clock_hour, clock_minute, clock_second)
-		} else {
-			fmt.Println("Clock is paused")
-		}
-
-		// Adjust sleep time based on fast forward flag and difference
-		if is_fast_forward {
-			mutex.Lock()
-			diff_value := time_diff // Capture the diff value safely inside the mutex
-			mutex.Unlock()
-
-			if diff_value > 60 {
-				time.Sleep(125 * time.Millisecond) // 8 ticks per second for large differences
-			} else {
-				time.Sleep(250 * time.Millisecond) // 4 ticks per second for small differences
-			}
-		} else {
-			time.Sleep(1 * time.Second)
-		}
-
+	wd, err := functions.NewWatchdog()
+	if err != nil {
+		log.Printf("watchdog init: %v", err)
+		wd = &functions.Watchdog{}
 	}
+	defer wd.Close()
+
+	clk, err := setup(cfg)
+	if err != nil {
+		log.Fatalf("setup: %v", err)
+	}
+	defer clk.shutdown() // drives pins low and calls rpio.Close() as its last step
+
+	clk.initPosition(*hourFlag, *minuteFlag, *secondFlag)
+
+	go ntpLoop(ctx, clk.rtc)
+
+	if err := wd.Ready(); err != nil {
+		log.Printf("watchdog ready: %v", err)
+	}
+	log.Printf("starting tick loop")
+	clk.run(ctx, wd)
+
+	if err := wd.Stopping(); err != nil {
+		log.Printf("watchdog stopping: %v", err)
+	}
+	log.Printf("clean shutdown")
 }
