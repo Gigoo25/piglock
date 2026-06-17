@@ -1,0 +1,42 @@
+[Unit]
+Description=PiClock - Raspberry Pi Analog Clock Controller
+After=network-online.target
+Wants=network-online.target
+# If it dies repeatedly, keep restarting forever rather than giving up.
+StartLimitIntervalSec=0
+
+[Service]
+# Type=notify: the binary signals READY=1 once initialized and pings WATCHDOG=1
+# each tick. If the heartbeat stops, systemd kills and restarts it.
+Type=notify
+WatchdogSec=15
+NotifyAccess=main
+
+ExecStart=/usr/bin/piclock
+Restart=always
+RestartSec=5
+
+User=dietpi
+Group=dietpi
+# GPIO (/dev/gpiomem) needs the gpio group; I2C (RTC + FRAM) needs i2c.
+SupplementaryGroups=gpio i2c
+
+# Allow SCHED_FIFO real-time priority for the pulse thread (steady coil timing).
+# Without it the binary still runs, just without RT priority.
+AmbientCapabilities=CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_NICE
+LimitRTPRIO=99
+
+StandardOutput=journal
+StandardError=journal
+Environment=PICLOCK_LOG_LEVEL=info
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
