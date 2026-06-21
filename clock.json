@@ -1,12 +1,12 @@
 {
   "_comment": "Tick-parameter config for piclock. Defaults shown are ESPCLOCK4 20cm values for direct GPIO drive (3.3V, no clamp). Deploy to /etc/piclock/clock.json. Calibrate reverse with `piclock -test rev` before trusting it. Pulses are software-PWM: a 100us carrier driven high for *_on_us of each 100us (100 = solid pulse, use that if you add a diode clamp). Missing keys keep the built-in default.",
 
-  "norm_tick_ms": 31,
-  "norm_on_us": 60,
+  "norm_tick_ms": 50,
+  "norm_on_us": 100,
 
-  "fwd_tick_ms": 32,
-  "fwd_on_us": 60,
-  "fwd_rate": 4,
+  "fwd_tick_ms": 50,
+  "fwd_on_us": 100,
+  "fwd_rate": 2,
 
   "rev_a_lo": 35,
   "rev_a_hi": 55,
@@ -22,5 +22,5 @@
 
   "rev_rate": 2,
 
-  "reverse_enabled": true
+  "reverse_enabled": false
 }

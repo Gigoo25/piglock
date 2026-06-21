@@ -44,13 +44,13 @@ type TickConfig struct {
 // DefaultTickConfig returns the ESPCLOCK4 20cm-clock parameters.
 func DefaultTickConfig() TickConfig {
 	return TickConfig{
-		NormTickMS: 31, NormOnUS: 60,
-		FwdTickMS: 32, FwdOnUS: 60, FwdRate: 4,
+		NormTickMS: 50, NormOnUS: 100,
+		FwdTickMS: 50, FwdOnUS: 100, FwdRate: 2,
 		RevALo: 35, RevAHi: 55,
 		RevAT1MS: 10, RevAT2MS: 7, RevAT3MS: 28, RevAOnUS: 90,
 		RevBT1MS: 10, RevBT2MS: 7, RevBT3MS: 28, RevBOnUS: 82,
 		RevRate:    2,
-		RevEnabled: true,
+		RevEnabled: false,
 	}
 }
 

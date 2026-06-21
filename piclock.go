@@ -38,6 +38,15 @@ const (
 
 	defaultConfigPath = "/etc/piclock/clock.json"
 	testPreTicks      = 5 // forward ticks to settle polarity before a test run
+
+	// After rtcReopenAfter consecutive RTC read failures the I2C device is
+	// reopened (retried every rtcReopenAfter thereafter). The loop never exits or
+	// restarts on RTC failure: a stuck/dead bus is not fixed by a fresh process,
+	// and restarting reintroduces the startup settle as a visible freeze. Instead
+	// the loop free-wheels forward at 1 Hz indefinitely and self-corrects the
+	// instant the bus returns. A true hang is still caught by the systemd
+	// watchdog (WatchdogSec).
+	rtcReopenAfter = 10
 )
 
 // Clock owns all hardware, the tick parameters, and the single authoritative
@@ -52,18 +61,22 @@ type Clock struct {
 	pos  position
 }
 
-// nextAction reads the time source and decides the next tick action.
+// nextAction reads the time source and decides the next tick action. A returned
+// error means the RTC read failed; the action is still actStepNormal so the
+// caller free-wheels forward at 1 Hz (the hands were correct and real time also
+// advances 1 Hz, so they stay correct through a bus outage) while counting the
+// error toward bus recovery. Freezing the hands is strictly worse.
 func (c *Clock) nextAction() (action, error) {
 	stopped, err := c.rtc.OscillatorStopped()
 	if err != nil {
-		return actHold, err // RTC unreadable: hold rather than move blindly
+		return actStepNormal, err // RTC unreadable: free-wheel, signal for recovery
 	}
 	if stopped {
 		return actStepNormal, nil // time untrusted: free-wheel forward at 1 Hz
 	}
 	h, m, s, err := c.rtc.ReadClock()
 	if err != nil {
-		return actHold, err
+		return actStepNormal, err // RTC unreadable: free-wheel, signal for recovery
 	}
 	target := (h%12)*3600 + m*60 + s
 	if err := functions.Assert(target >= 0 && target < dialSeconds, "target dial in range"); err != nil {
@@ -85,6 +98,7 @@ func (c *Clock) nextAction() (action, error) {
 func (c *Clock) run(ctx context.Context, wd *functions.Watchdog) {
 	fastSleep := time.Second / time.Duration(c.cfg.FwdRate)
 	revSleep := time.Second / time.Duration(c.cfg.RevRate)
+	consecErrs := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -98,9 +112,11 @@ func (c *Clock) run(ctx context.Context, wd *functions.Watchdog) {
 		}
 		act, err := c.nextAction()
 		if err != nil {
-			log.Printf("decision: %v", err)
-			sleepRemaining(ctx, start, normalSleep)
-			continue
+			consecErrs++
+			log.Printf("decision (rtc err %d): %v", consecErrs, err)
+			c.recoverRTC(consecErrs)
+		} else {
+			consecErrs = 0
 		}
 		switch act {
 		case actStepFast:
@@ -115,6 +131,19 @@ func (c *Clock) run(ctx context.Context, wd *functions.Watchdog) {
 		default: // actHold: keep the 1 Hz cadence so the next tick lands on time
 			sleepRemaining(ctx, start, normalSleep)
 		}
+	}
+}
+
+// recoverRTC reopens the I2C device every rtcReopenAfter consecutive RTC errors
+// to clear a stale file descriptor. It never exits: the hands keep free-wheeling
+// at 1 Hz and self-correct when the bus returns (see the rtcReopenAfter comment).
+func (c *Clock) recoverRTC(consec int) {
+	if consec > 0 && consec%rtcReopenAfter == 0 {
+		if err := c.rtc.Reopen(); err != nil {
+			log.Printf("rtc reopen failed: %v", err)
+			return
+		}
+		log.Printf("rtc reopened after %d consecutive errors", consec)
 	}
 }
 
@@ -162,8 +191,10 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	}
 }
 
-// rtcWaitTries bounds the startup wait for the RTC (Power-of-Ten rule 2).
-const rtcWaitTries = 30
+// rtcWaitTries bounds the startup wait for the RTC (Power-of-Ten rule 2). Kept
+// short: a slow bus only needs a moment to settle, and if it never responds the
+// run loop free-wheels rather than holding the hands frozen during a long wait.
+const rtcWaitTries = 3
 
 // waitForRTC waits, with a fixed upper bound, for the DS3231 to respond so a
 // slow or briefly-flaky I2C bus at boot does not crash-loop the service.
@@ -201,7 +232,11 @@ func setup(cfg TickConfig) (*Clock, error) {
 		return nil, err
 	}
 	if err := waitForRTC(rtc); err != nil {
-		return nil, err
+		// Don't crash-loop on a dead/contended RTC at boot: the device handle is
+		// open, so start anyway and let the run loop free-wheel at 1 Hz and run
+		// the bus-recovery ladder (reopen, then restart). Freezing or refusing to
+		// start is strictly worse.
+		log.Printf("RTC not responding at startup, free-wheeling until it recovers: %v", err)
 	}
 	if err := rtc.EnsureRunning(); err != nil {
 		log.Printf("ensure RTC oscillator running: %v", err)

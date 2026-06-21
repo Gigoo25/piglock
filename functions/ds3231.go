@@ -37,6 +37,7 @@ const (
 type DS3231 struct {
 	mu     sync.Mutex
 	device *i2c.I2C
+	bus    int
 }
 
 // NewDS3231 creates a new connection to the DS3231 RTC.
@@ -52,7 +53,32 @@ func NewDS3231(bus int) (*DS3231, error) {
 	if err := Assert(device != nil, "i2c device non-nil"); err != nil {
 		return nil, err
 	}
-	return &DS3231{device: device}, nil
+	return &DS3231{device: device, bus: bus}, nil
+}
+
+// Reopen closes and reopens the underlying I2C device. It recovers from a wedged
+// bus or stale file descriptor (e.g. persistent EIO) without restarting the
+// process. All other access is serialized by d.mu, so a concurrent caller (the
+// NTP goroutine) is safe across the swap.
+func (d *DS3231) Reopen() error {
+	if err := Assert(d.bus >= 0, "i2c bus non-negative"); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.device != nil {
+		d.device.Close()
+		d.device = nil
+	}
+	device, err := i2c.NewI2C(DS3231_ADDRESS, d.bus)
+	if err != nil {
+		return fmt.Errorf("reopen DS3231: %v", err)
+	}
+	if err := Assert(device != nil, "i2c device non-nil after reopen"); err != nil {
+		return err
+	}
+	d.device = device
+	return nil
 }
 
 // Close closes the connection to the DS3231.
@@ -79,6 +105,9 @@ func decToBcd(dec int) byte {
 func (d *DS3231) readRegLocked(reg byte, count int) ([]byte, error) {
 	if err := Assert(count > 0 && count <= 8, "read count in 1..8"); err != nil {
 		return nil, err
+	}
+	if d.device == nil {
+		return nil, fmt.Errorf("DS3231 device not open")
 	}
 	var lastErr error
 	for range ds3231Retries {
@@ -151,6 +180,9 @@ func (d *DS3231) ReadClock() (hour, minute, second int, err error) {
 
 // setFullTimeLocked writes the complete time in 24-hour mode. Caller holds d.mu.
 func (d *DS3231) setFullTimeLocked(t time.Time) error {
+	if d.device == nil {
+		return fmt.Errorf("DS3231 device not open")
+	}
 	writes := []struct {
 		reg byte
 		val byte
